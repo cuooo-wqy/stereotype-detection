@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 模型和数据（按需删减）
+outputs/
+*.bin
+*.safetensors
+*.pt
+*.ckpt
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 日志
+*.logS
