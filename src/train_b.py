@@ -21,7 +21,7 @@ from sklearn.preprocessing import LabelEncoder
 MODEL_NAME = "xlm-roberta-base"  # 多语言模型
 MAX_LEN = 256
 BATCH_SIZE = 8
-EPOCHS = 3
+EPOCHS = 5
 
 # 自动获取项目根目录和 data 目录
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -118,7 +118,7 @@ training_args = TrainingArguments(
     per_device_eval_batch_size=16,
     num_train_epochs=EPOCHS,
     weight_decay=0.01,
-    evaluation_strategy="epoch",  # 每个 epoch 评估一次
+    eval_strategy="epoch",  # 每个 epoch 评估一次
     save_strategy="epoch",  # 每个 epoch 保存一次
     load_best_model_at_end=True,  # 训练结束加载最好的一次
     metric_for_best_model="macro_f1",
