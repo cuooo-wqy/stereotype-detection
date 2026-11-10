@@ -35,14 +35,14 @@ def load_data():
     print("正在读取数据...")
     en_path = os.path.join(DATA_DIR, "StereoQueerEval_EN_training.tsv")
     nl_path = os.path.join(DATA_DIR, "StereoQueerEval_NL_training.tsv")
-    il_path = os.path.join(DATA_DIR, "StereoQueerEval_IT_training.tsv")
+    it_path = os.path.join(DATA_DIR, "StereoQueerEval_IT_training.tsv")
 
     df_en = pd.read_csv(en_path, sep="\t")
     df_nl = pd.read_csv(nl_path, sep="\t")
-    df_il = pd.read_csv(il_path, sep="\t")
+    df_it = pd.read_csv(it_path, sep="\t")
 
     # 把英文和荷兰文合并在一起训练
-    df = pd.concat([df_en, df_nl,df_il], ignore_index=True)
+    df = pd.concat([df_en, df_nl,df_it], ignore_index=True)
 
     # 拼接文本上下文：标题 + 描述 + 评论
     df["text"] = (
