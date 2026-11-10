@@ -21,7 +21,7 @@ from sklearn.preprocessing import LabelEncoder
 MODEL_NAME = "xlm-roberta-base"  # 多语言模型
 MAX_LEN = 256
 BATCH_SIZE = 8
-EPOCHS = 3
+EPOCHS = 5
 
 # 自动获取项目根目录和 data 目录
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
