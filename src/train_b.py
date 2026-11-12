@@ -1,10 +1,14 @@
 import os
-os.environ["USE_TF"] = "0"               # 强制禁止加载 TensorFlow
+
+os.environ["USE_TF"] = "0"
 os.environ["TRANSFORMERS_NO_TF"] = "1"
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"  # 国内镜像
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
 import pandas as pd
 import numpy as np
 import torch
+from torch import nn
 from torch.utils.data import Dataset
 from transformers import (
     AutoTokenizer,
@@ -13,24 +17,23 @@ from transformers import (
     TrainingArguments,
     DataCollatorWithPadding
 )
-from sklearn.metrics import accuracy_score, f1_score,classification_report
+from sklearn.metrics import accuracy_score, f1_score, classification_report
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
 # ================= 1. 路径与参数配置 =================
-MODEL_NAME = "xlm-roberta-base"  # 多语言模型
+MODEL_NAME = "xlm-roberta-base"
 MAX_LEN = 256
 BATCH_SIZE = 8
 EPOCHS = 5
 
-# 自动获取项目根目录和 data 目录
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs", "model_b")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-# ================= 2. 数据加载与预处理 =================
+# ================= 2. 数据加载 =================
 def load_data():
     print("正在读取数据...")
     en_path = os.path.join(DATA_DIR, "StereoQueerEval_EN_training.tsv")
@@ -41,17 +44,14 @@ def load_data():
     df_nl = pd.read_csv(nl_path, sep="\t")
     df_it = pd.read_csv(it_path, sep="\t")
 
-    # 把英文和荷兰文合并在一起训练
-    df = pd.concat([df_en, df_nl,df_it], ignore_index=True)
+    df = pd.concat([df_en, df_nl, df_it], ignore_index=True)
 
-    # 拼接文本上下文：标题 + 描述 + 评论
     df["text"] = (
             "Title: " + df["yt_title"].fillna("") +
             " | Description: " + df["yt_description"].fillna("") +
             " | Comment: " + df["yt_comment"].fillna("")
     )
 
-    # 任务 A 的标签是 stereotype 列 (no/yes)
     texts = df["text"].tolist()
     labels = df["hate_speech"].tolist()
     return texts, labels
@@ -59,13 +59,11 @@ def load_data():
 
 texts, raw_labels = load_data()
 
-# 将文本标签转为数字（如 no->0, yes->1）
 label_encoder = LabelEncoder()
 labels = label_encoder.fit_transform(raw_labels)
 num_labels = len(label_encoder.classes_)
 print(f"标签映射: {dict(zip(label_encoder.classes_, range(num_labels)))}")
 
-# 划分 80% 训练集，20% 验证集
 train_texts, val_texts, train_labels, val_labels = train_test_split(
     texts, labels, test_size=0.2, random_state=42, stratify=labels
 )
@@ -91,43 +89,66 @@ class HFDataset(Dataset):
 train_dataset = HFDataset(train_texts, train_labels)
 val_dataset = HFDataset(val_texts, val_labels)
 
-# ================= 4. 训练模型 =================
+# ================= 4. 训练模型 & 加权计算 =================
 model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=num_labels)
+
+# 自动计算类别权重
+class_counts = np.bincount(train_labels)
+total_samples = len(train_labels)
+# 样本越少的类别，权重越大
+class_weights = total_samples / (num_labels * class_counts)
+class_weights = torch.tensor(class_weights, dtype=torch.float).to("cuda" if torch.cuda.is_available() else "cpu")
+print(f"自动计算的类别权重: {class_weights}")
 
 
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=-1)
-    # 因为是多分类且可能类别不平衡，计算每个类别的 F1 很重要
-    report = classification_report(labels, preds, output_dict=True, zero_division=0)
 
+    # 【改动 2】：直接打印完整的分类报告，包含 no 的 F1
+    print("\n" + "=" * 50)
+    print(classification_report(labels, preds, target_names=label_encoder.classes_, zero_division=0))
+    print("=" * 50 + "\n")
+
+    report = classification_report(labels, preds, output_dict=True, zero_division=0)
     return {
-        "accuracy": accuracy_score(labels, preds),
         "macro_f1": f1_score(labels, preds, average="macro"),
-        # 打印出显式仇恨和隐式仇恨的 F1
-        "f1_explicit": report.get("1", {}).get("f1-score", 0.0),  # 假设 1 是 explicit
-        "f1_implicit": report.get("2", {}).get("f1-score", 0.0)  # 假设 2 是 implicit
+        "f1_no": report.get("0", {}).get("f1-score", 0.0),  # 非仇恨/支持
+        "f1_explicit": report.get("1", {}).get("f1-score", 0.0),  # 显式仇恨
+        "f1_implicit": report.get("2", {}).get("f1-score", 0.0)  # 隐式仇恨
     }
 
 
-# 设置训练参数
+# 自定义带权重的 Trainer
+class WeightedLossTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+        # 使用带有权重的交叉熵损失函数
+        loss_fct = nn.CrossEntropyLoss(weight=class_weights)
+        loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
+        return (loss, outputs) if return_outputs else loss
+
+
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
-    learning_rate=1e-5,
+    learning_rate=2e-5,
     per_device_train_batch_size=BATCH_SIZE,
     per_device_eval_batch_size=16,
     num_train_epochs=EPOCHS,
     weight_decay=0.01,
-    eval_strategy="epoch",  # 每个 epoch 评估一次
-    save_strategy="epoch",  # 每个 epoch 保存一次
-    load_best_model_at_end=True,  # 训练结束加载最好的一次
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    load_best_model_at_end=True,
     metric_for_best_model="macro_f1",
     greater_is_better=True,
     logging_steps=50,
-    fp16=torch.cuda.is_available(),  # 有 GPU 自动加速
+    fp16=torch.cuda.is_available(),
 )
 
-trainer = Trainer(
+# 自定义的 WeightedLossTrainer
+trainer = WeightedLossTrainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
@@ -136,10 +157,9 @@ trainer = Trainer(
     data_collator=DataCollatorWithPadding(tokenizer=tokenizer)
 )
 
-print("开始训练任务 B (刻板印象检测)...")
+print(" 开始训练任务 B (仇恨识别)...")
 trainer.train()
 
-# 保存最终模型和分词器
 trainer.save_model(OUTPUT_DIR)
 tokenizer.save_pretrained(OUTPUT_DIR)
 print(f"训练完成！模型已保存到 {OUTPUT_DIR}")
