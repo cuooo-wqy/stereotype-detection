@@ -106,7 +106,7 @@ def compute_metrics(eval_pred):
     logits, labels = eval_pred
     # 多标签通常用 sigmoid 计算概率，阈值设为 0.5
     probs = torch.sigmoid(torch.tensor(logits)).numpy()
-    preds = (probs > 0.5).astype(int)
+    preds = (probs > 0.3).astype(int)
 
     # 计算 micro 和 macro F1
     micro_f1 = f1_score(labels, preds, average="micro", zero_division=0)
