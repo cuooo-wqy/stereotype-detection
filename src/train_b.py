@@ -27,6 +27,12 @@ MAX_LEN = 256
 BATCH_SIZE = 8
 EPOCHS = 5
 
+#LLRD参数
+ENCODER_LR = 2e-5     # 编码器最后一层的基础学习率
+HEAD_LR = 1e-4        # 分类头(head)的学习率
+LAYER_DECAY = 0.90    # 分层衰减率
+WEIGHT_DECAY = 0.01   # 权重衰减
+
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs", "model_b")
@@ -119,25 +125,62 @@ def compute_metrics(eval_pred):
     }
 
 
-# 自定义带权重的 Trainer
+# 1. 插入 LLRD 核心函数
+def create_llrd_parameter_groups(model, encoder_lr, head_lr, layer_decay, weight_decay):
+    num_layers = len(model.roberta.encoder.layer)
+    no_decay_tokens = ("bias", "LayerNorm.weight", "LayerNorm.bias")
+    groups = []
+    assigned_ids = set()
+
+    def add_module(module, prefix, lr):
+        for decay in (True, False):
+            params = []
+            for name, param in module.named_parameters():
+                if not param.requires_grad: continue
+                use_decay = not any(token in name for token in no_decay_tokens)
+                if use_decay != decay: continue
+                params.append(param)
+                assigned_ids.add(id(param))
+            if params:
+                groups.append({"params": params, "lr": lr, "weight_decay": weight_decay if decay else 0.0})
+
+    add_module(model.roberta.embeddings, "embeddings", encoder_lr * layer_decay ** num_layers)
+    for layer_id, layer in enumerate(model.roberta.encoder.layer):
+        lr = encoder_lr * layer_decay ** (num_layers - 1 - layer_id)
+        add_module(layer, f"encoder.layer.{layer_id}", lr)
+    if model.roberta.pooler is not None:
+        add_module(model.roberta.pooler, "pooler", head_lr)
+    add_module(model.classifier, "classifier", head_lr)
+    return groups
+
+# 2. 修改 Trainer 类
 class WeightedLossTrainer(Trainer):
+    def create_optimizer(self):
+        if self.optimizer is None:
+            groups = create_llrd_parameter_groups(
+                self.model, ENCODER_LR, HEAD_LR, LAYER_DECAY, WEIGHT_DECAY
+            )
+            self.optimizer = torch.optim.AdamW(groups, lr=ENCODER_LR)
+        return self.optimizer
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
         logits = outputs.get("logits")
-        # 使用带有权重的交叉熵损失函数
-        loss_fct = nn.CrossEntropyLoss(weight=class_weights)
+        #加上了 label_smoothing=0.1
+        loss_fct = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
         loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
         return (loss, outputs) if return_outputs else loss
 
 
+
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
-    learning_rate=1e-5,
+    learning_rate=ENCODER_LR,
     per_device_train_batch_size=BATCH_SIZE,
     per_device_eval_batch_size=16,
     num_train_epochs=EPOCHS,
-    weight_decay=0.01,
+    weight_decay=WEIGHT_DECAY,
     eval_strategy="epoch",
     save_strategy="epoch",
     load_best_model_at_end=True,
@@ -157,7 +200,7 @@ trainer = WeightedLossTrainer(
     data_collator=DataCollatorWithPadding(tokenizer=tokenizer)
 )
 
-print(" 开始训练任务 B (仇恨识别)...")
+print(" 开始训练任务B(仇恨识别)...")
 trainer.train()
 
 trainer.save_model(OUTPUT_DIR)

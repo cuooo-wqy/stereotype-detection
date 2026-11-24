@@ -23,6 +23,12 @@ MAX_LEN = 256
 BATCH_SIZE = 8
 EPOCHS = 5
 
+#LLRD参数
+ENCODER_LR = 2e-5     # 编码器最后一层的基础学习率
+HEAD_LR = 1e-4        # 分类头(head)的学习率
+LAYER_DECAY = 0.90    # 分层衰减率
+WEIGHT_DECAY = 0.01   # 权重衰减
+
 # 自动获取项目根目录和 data 目录
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -94,6 +100,49 @@ val_dataset = HFDataset(val_texts, val_labels)
 # ================= 4. 训练模型 =================
 model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME, num_labels=num_labels)
 
+# LLRD 核心逻辑
+def create_llrd_parameter_groups(model, encoder_lr, head_lr, layer_decay, weight_decay):
+    """拆解 XLM-R 的每一层，分配不同的学习率"""
+    num_layers = len(model.roberta.encoder.layer)
+    no_decay_tokens = ("bias", "LayerNorm.weight", "LayerNorm.bias")
+    groups = []
+    assigned_ids = set()
+
+    def add_module(module, prefix, lr):
+        for decay in (True, False):
+            params = []
+            for name, param in module.named_parameters():
+                if not param.requires_grad: continue
+                use_decay = not any(token in name for token in no_decay_tokens)
+                if use_decay != decay: continue
+                params.append(param)
+                assigned_ids.add(id(param))
+            if params:
+                groups.append({"params": params, "lr": lr, "weight_decay": weight_decay if decay else 0.0})
+
+    # 1. Embeddings 层
+    add_module(model.roberta.embeddings, "embeddings", encoder_lr * layer_decay ** num_layers)
+    # 2. 12 层 Encoder
+    for layer_id, layer in enumerate(model.roberta.encoder.layer):
+        lr = encoder_lr * layer_decay ** (num_layers - 1 - layer_id)
+        add_module(layer, f"encoder.layer.{layer_id}", lr)
+    # 3. 分类头 (Pooler 和 Classifier)
+    if model.roberta.pooler is not None:
+        add_module(model.roberta.pooler, "pooler", head_lr)
+    add_module(model.classifier, "classifier", head_lr)
+    return groups
+
+class LLRDTrainer(Trainer):
+    """自定义 Trainer，重写优化器的创建逻辑"""
+    def create_optimizer(self):
+        if self.optimizer is None:
+            groups = create_llrd_parameter_groups(
+                self.model, ENCODER_LR, HEAD_LR, LAYER_DECAY, WEIGHT_DECAY
+            )
+            self.optimizer = torch.optim.AdamW(groups, lr=ENCODER_LR)
+        return self.optimizer
+
+
 
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
@@ -107,11 +156,11 @@ def compute_metrics(eval_pred):
 # 设置训练参数
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
-    learning_rate=1e-5,
+    learning_rate=ENCODER_LR,
     per_device_train_batch_size=BATCH_SIZE,
     per_device_eval_batch_size=16,
     num_train_epochs=EPOCHS,
-    weight_decay=0.01,
+    weight_decay=WEIGHT_DECAY,
     eval_strategy="epoch",  # 每个 epoch 评估一次
     save_strategy="epoch",  # 每个 epoch 保存一次
     load_best_model_at_end=True,  # 训练结束加载最好的一次
@@ -120,8 +169,8 @@ training_args = TrainingArguments(
     logging_steps=50,
     fp16=torch.cuda.is_available(),  # 有 GPU 自动加速
 )
-
-trainer = Trainer(
+# 使用自定义的 LLRDTrainer
+trainer = LLRDTrainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
@@ -129,6 +178,8 @@ trainer = Trainer(
     compute_metrics=compute_metrics,
     data_collator=DataCollatorWithPadding(tokenizer=tokenizer)
 )
+
+
 
 print("开始训练任务 A (刻板印象检测)...")
 trainer.train()

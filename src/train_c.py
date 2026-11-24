@@ -1,5 +1,5 @@
 import os
-
+import inspect
 os.environ["USE_TF"] = "0"
 os.environ["TRANSFORMERS_NO_TF"] = "1"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
@@ -24,6 +24,12 @@ MODEL_NAME = "xlm-roberta-base"
 MAX_LEN = 256
 BATCH_SIZE = 8
 EPOCHS = 5
+
+#LLRD参数
+ENCODER_LR = 2e-5     # 编码器最后一层的基础学习率
+HEAD_LR = 1e-4        # 分类头(head)的学习率
+LAYER_DECAY = 0.90    # 分层衰减率
+WEIGHT_DECAY = 0.01   # 权重衰减
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -101,6 +107,44 @@ model = AutoModelForSequenceClassification.from_pretrained(
     problem_type="multi_label_classification"
 )
 
+#LLRD 核心逻辑
+def create_llrd_parameter_groups(model, encoder_lr, head_lr, layer_decay, weight_decay):
+    num_layers = len(model.roberta.encoder.layer)
+    no_decay_tokens = ("bias", "LayerNorm.weight", "LayerNorm.bias")
+    groups = []
+    assigned_ids = set()
+
+    def add_module(module, prefix, lr):
+        for decay in (True, False):
+            params = []
+            for name, param in module.named_parameters():
+                if not param.requires_grad: continue
+                use_decay = not any(token in name for token in no_decay_tokens)
+                if use_decay != decay: continue
+                params.append(param)
+                assigned_ids.add(id(param))
+            if params:
+                groups.append({"params": params, "lr": lr, "weight_decay": weight_decay if decay else 0.0})
+
+    add_module(model.roberta.embeddings, "embeddings", encoder_lr * layer_decay ** num_layers)
+    for layer_id, layer in enumerate(model.roberta.encoder.layer):
+        lr = encoder_lr * layer_decay ** (num_layers - 1 - layer_id)
+        add_module(layer, f"encoder.layer.{layer_id}", lr)
+    if model.roberta.pooler is not None:
+        add_module(model.roberta.pooler, "pooler", head_lr)
+    add_module(model.classifier, "classifier", head_lr)
+    return groups
+
+# 自定义 Trainer 接入 LLRD
+class LL_RD_Trainer(Trainer):
+    def create_optimizer(self):
+        if self.optimizer is None:
+            groups = create_llrd_parameter_groups(
+                self.model, ENCODER_LR, HEAD_LR, LAYER_DECAY, WEIGHT_DECAY
+            )
+            self.optimizer = torch.optim.AdamW(groups, lr=ENCODER_LR)
+        return self.optimizer
+
 
 def compute_metrics(eval_pred):
     logits, labels = eval_pred
@@ -124,7 +168,7 @@ training_args = TrainingArguments(
     per_device_train_batch_size=BATCH_SIZE,
     per_device_eval_batch_size=16,
     num_train_epochs=EPOCHS,
-    weight_decay=0.01,
+    weight_decay=WEIGHT_DECAY,
     eval_strategy="epoch",
     save_strategy="epoch",
     load_best_model_at_end=True,
@@ -134,18 +178,32 @@ training_args = TrainingArguments(
     fp16=torch.cuda.is_available(),
 )
 
-trainer = Trainer(
+# 使用自定义的 LL_RD_Trainer 并兼容 tokenizer 参数
+trainer_kwargs = dict(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
     eval_dataset=val_dataset,
     compute_metrics=compute_metrics,
-    data_collator=DataCollatorWithPadding(tokenizer=tokenizer)
+    data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
 )
+if "processing_class" in inspect.signature(Trainer.__init__).parameters:
+    trainer_kwargs["processing_class"] = tokenizer
+else:
+    trainer_kwargs["tokenizer"] = tokenizer
 
-print("开始训练任务 C (多标签 Target 识别)...")
+trainer = LL_RD_Trainer(**trainer_kwargs)
+
+print("开始训练任务 C (多标签 Target + LLRD)...")
 trainer.train()
 
+# 保存模型和 tokenizer
 trainer.save_model(OUTPUT_DIR)
 tokenizer.save_pretrained(OUTPUT_DIR)
+
+# 保存 MultiLabelBinarizer (mlb)，预测解码时不可或缺！
+import pickle
+with open(os.path.join(OUTPUT_DIR, "mlb.pkl"), "wb") as f:
+    pickle.dump(mlb, f)
+
 print(f"任务 C 训练完成！模型已保存到 {OUTPUT_DIR}")
